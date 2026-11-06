@@ -86,6 +86,11 @@ jobs:
         # upstream iOS 27 source compiles as-is. Applied to the CI workspace
         # only - the mirror itself stays pristine.
         run: python3 .ci/scripts/apply-xcode26-patches.py .
+      - name: Apply CI widget patch (home/lock-screen entry card)
+        # Copies Widget/YingxiaWidget.swift and a TVBox-Widget app-extension
+        # target into the workspace copy of project.yml. The mirror stays
+        # untouched: neither file exists in mlzbest/mmusic.
+        run: python3 .ci/scripts/apply-widget-patch.py .
 
       - name: Report toolchain
         run: |
@@ -206,6 +211,23 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build 2>&1 | tee build/xcodebuild-ios.log
 
+      - name: Build widget extension (arm64, Release)
+        # Its own scheme on purpose: upstream TVBox-iOS declares no widget
+        # dependency, and patching its dependency list risks dropping the
+        # TVCore package the SharedApp template provides. The packaging step
+        # copies the .appex into PlugIns instead.
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project TVBox.xcodeproj \
+            -scheme TVBox-Widget \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData-widget \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee build/xcodebuild-widget.log
+
       - name: Package unsigned .ipa
         run: |
           APP=$(find build/DerivedData-ios/Build/Products -maxdepth 2 -type d -name 'TVBox-iOS.app' -print -quit)
@@ -216,6 +238,17 @@ jobs:
           echo "Found app: $APP"
           rm -rf build/ipa && mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/
+          # CI widget patch: embed the entry-card extension. Sideloadly
+          # re-signs PlugIns along with the app; iOS ignores an appex that is
+          # missing here. Fail loudly rather than ship a card-less "widget" build.
+          APPEX=$(find build/DerivedData-widget/Build/Products -maxdepth 2 -type d -name 'TVBox-Widget.appex' -print -quit)
+          if [ -z "$APPEX" ]; then
+            echo "::error::TVBox-Widget.appex not found. Check build/xcodebuild-widget.log"
+            exit 1
+          fi
+          mkdir -p build/ipa/Payload/TVBox-iOS.app/PlugIns
+          cp -R "$APPEX" build/ipa/Payload/TVBox-iOS.app/PlugIns/
+          echo "Embedded widget: $APPEX"
           # -y preserves symlinks inside frameworks.
           (cd build/ipa && zip -qry ../Yingxia-unsigned.ipa Payload)
           ls -lh build/Yingxia-unsigned.ipa
