@@ -11,9 +11,13 @@ Root cause: upstream ships forward-looking iOS 27 branches, but GitHub's
 macos-latest runner has Xcode 26 / iOS 26 SDK. @available() guards the runtime
 call, not compile-time symbol resolution, so those branches fail to type-check.
 
-Each patch is idempotent (marker-checked). If upstream later changes one of the
-anchored snippets, this script fails loudly with a clear message instead of
-silently producing a broken or reverted source tree.
+The last patch is a small functional fix (not an SDK workaround): the upstream
+file importer only allows .json/.py/.js UTTypes, which leaves most files saved
+from WeChat / Safari / the Files app greyed out in the iOS document picker.
+
+Each patch is idempotent (checked by looking for the full replacement text). If
+upstream later changes one of the anchored snippets, this script fails loudly
+with a clear message instead of silently producing a broken or reverted tree.
 
 Usage: python3 apply-xcode26-patches.py <source-root>
 """
@@ -133,6 +137,20 @@ private final class ExternalDisplayAccessoryController: UIViewController {
         return max(width, height) <= 1280 && width * height <= 1280 * 720
 """,
     ),
+    (
+        "App/SettingsView.swift",
+        "SubscriptionFile.types widened with .data",
+        """    static let types: [UTType] = [.json, .pythonScript, .javaScript]
+""",
+        """    // CI patch: iOS classifies files saved from WeChat, Safari or the Files
+    // app as public.data or a dynamic UTType, not public.json. With only
+    // .json / .pythonScript / .javaScript the document picker shows those
+    // files greyed out and they cannot be selected at all. `.data` is the
+    // base type of every file; the importer still parses by CONTENT
+    // (subscriptionImport probes the bytes, not the extension).
+    static let types: [UTType] = [.json, .plainText, .data, .pythonScript, .javaScript]
+""",
+    ),
 ]
 
 
@@ -171,10 +189,12 @@ def main():
     sniff = read(ROOT / "Sources/TVCore/ScriptSniffing.swift")
     live = read(ROOT / "App/LiveRoomsView.swift")
     video = read(ROOT / "App/VideoEnhancement.swift")
+    settings = read(ROOT / "App/SettingsView.swift")
     assert "var sites = sites" not in sniff, "Swift 6 sites shadowing still present"
     assert "Result { try await" not in live, "async Result closure still present"
     assert "#if TVBOX_OS27_SDK" in video, "iOS 27 symbol guard missing"
-    print("All Xcode 26 compatibility patches verified.")
+    assert ".data, .pythonScript" in settings, "file importer whitelist not widened"
+    print("All CI workspace patches verified.")
 
 
 if __name__ == "__main__":
