@@ -139,16 +139,18 @@ private final class ExternalDisplayAccessoryController: UIViewController {
     ),
     (
         "App/SettingsView.swift",
-        "SubscriptionFile.types widened with .data",
+        "SubscriptionFile.types widened with .item + .data",
         """    static let types: [UTType] = [.json, .pythonScript, .javaScript]
 """,
-        """    // CI patch: iOS classifies files saved from WeChat, Safari or the Files
-    // app as public.data or a dynamic UTType, not public.json. With only
+        """    // CI patch: iOS classifies files saved from WeChat, Safari, QQ or the
+    // Files app as public.data or a dynamic UTType (dyn.*), which may
+    // conform to public.item but NOT to public.data. With only
     // .json / .pythonScript / .javaScript the document picker shows those
-    // files greyed out and they cannot be selected at all. `.data` is the
-    // base type of every file; the importer still parses by CONTENT
-    // (subscriptionImport probes the bytes, not the extension).
-    static let types: [UTType] = [.json, .plainText, .data, .pythonScript, .javaScript]
+    // files greyed out and they cannot be selected at all. .item is the
+    // ROOT of the UTType hierarchy and matches literally every file,
+    // including extension-less and dyn.* ones. The importer still parses
+    // by CONTENT (subscriptionImport probes the bytes, not the extension).
+    static let types: [UTType] = [.item, .data, .content, .text, .plainText, .json, .pythonScript, .javaScript]
 """,
     ),
 ]
@@ -193,7 +195,7 @@ def main():
     assert "var sites = sites" not in sniff, "Swift 6 sites shadowing still present"
     assert "Result { try await" not in live, "async Result closure still present"
     assert "#if TVBOX_OS27_SDK" in video, "iOS 27 symbol guard missing"
-    assert ".data, .pythonScript" in settings, "file importer whitelist not widened"
+    assert "[.item, .data, .content" in settings, "file importer whitelist not widened"
     print("All CI workspace patches verified.")
 
 
