@@ -33,14 +33,35 @@ jobs:
           git clone --bare https://github.com/jo32/tvbox-silicon.git /tmp/upstream.git
           cd /tmp/upstream.git
           echo "upstream refs: $(git for-each-ref --format='%(refname)' | wc -l)"
-          git remote set-url --push origin "https://x-access-token:${MIRROR_TOKEN}@github.com/mlzbest/mmusic.git"
+          TARGET="https://x-access-token:${MIRROR_TOKEN}@github.com/mlzbest/mmusic.git"
+          BEFORE=$(git ls-remote "$TARGET" refs/heads/main | awk '{print $1}')
+          git remote set-url --push origin "$TARGET"
           # --mirror = force + prune: mlzbest/mmusic becomes byte-identical
           # to jo32/tvbox-silicon, including every branch and tag.
           git push --mirror origin
-          git ls-remote "https://x-access-token:${MIRROR_TOKEN}@github.com/mlzbest/mmusic.git" refs/heads/main
+          AFTER=$(git ls-remote "$TARGET" refs/heads/main | awk '{print $1}')
+          echo "MAIN_BEFORE=$BEFORE" >> "$GITHUB_ENV"
+          echo "MAIN_AFTER=$AFTER" >> "$GITHUB_ENV"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "MAIN_CHANGED=true" >> "$GITHUB_ENV"
+          else
+            echo "MAIN_CHANGED=false" >> "$GITHUB_ENV"
+          fi
 
       # Keep this controller repository active so GitHub does not disable
       # scheduled workflows after 60 days of inactivity.
+      # Only build when the source actually changed. A full cold build takes
+      # ~57 min, so an unchanged upstream must not trigger one every day.
+      - name: Trigger IPA build when upstream main changed
+        if: env.MAIN_CHANGED == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          echo "upstream main moved: $MAIN_BEFORE -> $MAIN_AFTER"
+          if ! gh workflow run build-unsigned-ipa.yml --repo mlzbest/upstream-sync --ref main; then
+            echo "::warning::IPA build could not be triggered (check MIRROR_TOKEN workflow scope)"
+          fi
+
       - name: Record successful sync
         run: |
           set -e

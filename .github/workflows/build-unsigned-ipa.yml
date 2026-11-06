@@ -1,0 +1,308 @@
+# Build an UNSIGNED iOS .ipa from the upstream tvbox-silicon source.
+#
+# This workflow lives in mlzbest/upstream-sync, NOT in mlzbest/mmusic:
+# mmusic is a byte-identical mirror of jo32/tvbox-silicon and must never
+# contain extra files. The mirror is checked out cross-repo into the workspace
+# ROOT so every relative path in Scripts/ and project.yml stays valid.
+#
+# The build chain below is the one validated by run 42036607258 (2026-11-05,
+# 57 min, first full success incl. packaging + auto release):
+#   FFmpeg -> desktop Java host -> cross-compiled iOS JVM -> embedded CPython
+#   -> nodejs-mobile -> XcodeGen -> xcodebuild -> IPA -> artifact -> Release.
+#
+# Xcode 26 / iOS 26 SDK compatibility patches are applied to the CI workspace
+# by scripts/apply-xcode26-patches.py (idempotent; fails loudly if upstream
+# changes an anchored snippet). They are NEVER written back to the mirror.
+#
+# Releases are published HERE (mlzbest/upstream-sync), not in mmusic: a tag
+# created in mmusic would be pruned by the next daily `git push --mirror`.
+#
+# Output is an UNSIGNED .ipa: sign with Sideloadly / AltStore / SideStore and
+# a free Apple ID (7-day refresh). Upstream is GPL-3.0.
+#
+# Triggers: manual (Actions -> Run workflow), or automatically from mirror.yml
+# whenever the upstream main branch SHA changes.
+#
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag; blank = v<versionName>-yyyyMMddHHmm"
+        required: false
+        type: string
+      release_notes:
+        description: "Release notes (use \n for newlines)"
+        required: false
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-unsigned-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Release arm64 unsigned IPA
+    # Xcode 26 / iOS 26 SDK is required (project.yml uses iOS 26/27 APIs,
+    # Swift 6.0, and a JDK 26 boot JDK for the embedded JVM).
+    runs-on: macos-latest
+    timeout-minutes: 360
+
+    env:
+      GIT_TERMINAL_PROMPT: '0'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+
+    steps:
+      # mmusic is a byte-identical mirror of jo32/tvbox-silicon and must not
+      # contain any extra files, so this workflow lives in upstream-sync and
+      # checks out the source cross-repo into the workspace root (keeps every
+      # relative path used by the build scripts unchanged).
+      - name: Checkout mmusic (upstream mirror) source
+        uses: actions/checkout@v4
+        with:
+          repository: mlzbest/mmusic
+          ref: main
+          token: ${{ secrets.MIRROR_TOKEN }}
+
+      - name: Checkout controller repo (patch scripts)
+        uses: actions/checkout@v4
+        with:
+          path: .ci
+
+      - name: Apply Xcode 26 SDK compatibility patches
+        # Exact fixes validated by run 42036607258. Applied to the CI
+        # workspace only - the mirror itself stays pristine.
+        run: python3 .ci/scripts/apply-xcode26-patches.py .
+
+      - name: Report toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+
+      - name: Select Xcode 26
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE" ]; then
+            echo "::error::No Xcode 26 on this runner. Pin a runner image that ships Xcode 26, or use a self-hosted Mac."
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Set up JDK 19 (desktop Java host)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '19'
+
+      - name: Install build tools
+        run: |
+          # XcodeGen regenerates TVBox.xcodeproj from project.yml.
+          # Maven builds build/JavaHost/host.jar; rsync is used by post-build phases.
+          brew install xcodegen maven rsync 2>/dev/null || true
+          # uv is used by the Python host; uv python installs the host CPython.
+          brew install uv 2>/dev/null || true
+          # Embedded OpenJDK cross-compile (package-apple-runtime.sh -> build-apple-jvm.sh)
+          # regenerates its configure script via autoconf; the remaining autotools +
+          # cmake/ninja/pkg-config/freetype cover the libffi / unicorn / capstone /
+          # keystone / native-bindings builds. (run 41986534959 failed: "Cannot find autoconf")
+          brew install autoconf automake libtool pkg-config cmake ninja ccache freetype gettext
+          xcodegen --version
+          mvn -version | head -3
+
+      - name: Restore runtime caches
+        id: runtimecache
+        # actions/cache@v4 only SAVES on a successful job. The first five runs
+        # all failed after the runtime builds, so every run paid the full
+        # ~38 min cold-build cost again. Split restore/save so a later
+        # xcodebuild/package failure still warms the cache for the next run.
+        uses: actions/cache/restore@v4
+        with:
+          # NOTE: build/apple-runtime (OpenJDK source + objects) can exceed the
+          # 10 GB GitHub cache limit. On a self-hosted runner this cache is
+          # unnecessary: the directory simply persists between runs.
+          path: |
+            ~/Library/Caches/tvbox-ffmpeg
+            build/FFmpeg
+            build/AppleRuntime
+            build/ApplePython
+            build/NodeMobile
+            build/apple-runtime
+            build/apple-python
+          key: yingxia-runtimes-${{ runner.os }}-${{ hashFiles('Scripts/build-apple-*.sh', 'Scripts/package-apple-runtime.sh', 'Scripts/fetch-node-mobile.sh') }}
+
+      - name: Build FFmpeg + dav1d xcframework
+        # Package.swift declares Vendor/FFmpeg/FFmpeg.xcframework as a local
+        # binaryTarget; that path is a symlink populated by this script.
+        run: Scripts/build-apple-ffmpeg.sh
+
+      - name: Build desktop Java host
+        # setup-java already exported JAVA_HOME; post-build phases run
+        # Scripts/check-java-host.sh against build/JavaHost/host.jar.
+        run: Scripts/build-java-host.sh
+
+      - name: Cross-compile and package the embedded iOS JVM  [SLOWEST]
+        # Internally: downloads Temurin JDK 26 + OpenJDK mobile sources,
+        # builds libffi / unicorn / capstone / keystone / native bindings,
+        # then jlinks a jimage. Produces build/AppleRuntime/iphoneos/lib/libTVAppleRuntime.a
+        run: Scripts/package-apple-runtime.sh ios
+
+      - name: Build embedded CPython for iOS
+        id: cpython
+        # build-apple-python.sh expects a python3.14 host interpreter.
+        run: |
+          brew install python@3.14 2>/dev/null || true
+          export HOST_PYTHON="$(brew --prefix python@3.14 2>/dev/null)/bin/python3.14"
+          if [ ! -x "$HOST_PYTHON" ]; then
+            echo "::error::python3.14 not available; set HOST_PYTHON to a 3.14 interpreter."
+            exit 1
+          fi
+          Scripts/build-apple-python.sh ios
+
+      - name: Fetch nodejs-mobile
+        # Optional at build time, but release builds are expected to include it
+        # (otherwise CatPawOpen sources are unsupported).
+        run: Scripts/fetch-node-mobile.sh
+
+      - name: Prepare macOS host folders (XcodeGen spec validation)
+        # project.yml lists build/ScriptHost and build/PythonHost as TVBox-macOS
+        # folder resources. XcodeGen validates EVERY target's source paths even
+        # when only TVBox-iOS is built, so both directories must exist (run
+        # 42014227303 failed here). These are Mac-only resources the iOS target
+        # never reads, so skip the slow Mac host builds and just create the
+        # directories with placeholders.
+        run: |
+          mkdir -p build/ScriptHost build/PythonHost
+          touch build/ScriptHost/.keep build/PythonHost/.keep
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned iOS app (arm64, Release)
+        # Mirrors Scripts/verify.sh, which uses CODE_SIGNING_ALLOWED=NO.
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project TVBox.xcodeproj \
+            -scheme TVBox-iOS \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData-ios \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee build/xcodebuild-ios.log
+
+      - name: Package unsigned .ipa
+        run: |
+          APP=$(find build/DerivedData-ios/Build/Products -maxdepth 2 -type d -name 'TVBox-iOS.app' -print -quit)
+          if [ -z "$APP" ]; then
+            echo "::error::TVBox-iOS.app not found. Check build/xcodebuild-ios.log"
+            exit 1
+          fi
+          echo "Found app: $APP"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          # -y preserves symlinks inside frameworks.
+          (cd build/ipa && zip -qry ../Yingxia-unsigned.ipa Payload)
+          ls -lh build/Yingxia-unsigned.ipa
+          # Confirm the bundle really is unsigned (expected: "code object is not signed at all").
+          codesign -dv build/ipa/Payload/TVBox-iOS.app 2>&1 || true
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yingxia-unsigned-ipa
+          path: build/Yingxia-unsigned.ipa
+          retention-days: 14
+          if-no-files-found: error
+
+      # Mooyingshi-style release: build succeeded -> create a GitHub Release,
+      # attach the unsigned IPA as a downloadable asset, and emit an
+      # apk->ipa update manifest (versionName, sha256, size, notes) that a
+      # client can poll. The IPA still requires Sideloadly/AltStore signing.
+      - name: Publish GitHub Release (Mooyingshi-style)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APP=$(find build/DerivedData-ios/Build/Products -maxdepth 2 -type d -name 'TVBox-iOS.app' -print -quit)
+          IPA=build/Yingxia-unsigned.ipa
+          VERSION_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist" 2>/dev/null || echo "0.0.0")
+          VERSION_CODE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist" 2>/dev/null || echo "0")
+          SHA256=$(shasum -a 256 "$IPA" | awk '{print $1}')
+          SIZE=$(stat -f%z "$IPA")
+          # GITHUB_SHA belongs to the controller repo; use the checked-out
+          # mirror commit so the release identifies the actual source build.
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date +%Y%m%d%H%M)
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then TAG="v${VERSION_NAME}-${DATE}"; fi
+          # Avoid clashing with an existing tag (e.g. re-run in the same minute).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then TAG="${TAG}-${GITHUB_RUN_ID}"; fi
+          CHANNEL="stable"
+          NOTES="${{ inputs.release_notes }}"
+          if [ -z "$NOTES" ]; then
+            NOTES="未签名 iOS IPA（commit ${COMMIT}）。需用 Sideloadly / AltStore / SideStore + 免费 Apple ID 自签安装（7 天刷新）。"
+          fi
+          ASSET_NAME="Yingxia-unsigned.ipa"
+          # GITHUB_REPOSITORY is mlzbest/upstream-sync - keep the Release and
+          # its tag here so the daily --mirror cannot prune them into drafts.
+          DL_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET_NAME}"
+          # Generate a Mooyingshi-style update manifest (apk -> ipa).
+          python3 - "$VERSION_NAME" "$VERSION_CODE" "$TAG" "$SHA256" "$SIZE" "$COMMIT" "$CHANNEL" "$NOTES" "$DL_URL" <<'PY'
+          import sys, json
+          vn, vc, tag, sha, size, commit, ch, notes, dl = sys.argv[1:10]
+          vc_int = int(vc) if str(vc).isdigit() else vc
+          manifest = {
+              "name": "Yingxia-unsigned-ipa",
+              "versionName": vn,
+              "versionCode": vc_int,
+              "code": vc_int,
+              "desc": "v%s-%s - %s" % (vn, tag, commit),
+              "channel": ch,
+              "ipa": dl,
+              "size": int(size),
+              "sha256": sha,
+              "downloads": {"github": {"url": dl}},
+              "notes": notes,
+          }
+          with open("update.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+          PY
+          PRERELEASE_FLAG=""
+          if [ "${{ inputs.prerelease }}" = "true" ]; then PRERELEASE_FLAG="--prerelease"; fi
+          gh release create "$TAG" "$IPA" update.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Yingxia ${VERSION_NAME} (${COMMIT}) · unsigned" \
+            --notes "$NOTES" \
+            $PRERELEASE_FLAG
+          echo "::notice::Released ${TAG} -> https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+
+      # Run even when a later step failed (if: always()), but only when the
+      # runtime products were actually produced. Cache upload is best-effort:
+      # build/apple-runtime can exceed the 10 GB limit, which must not turn an
+      # otherwise successful build red.
+      - name: Save runtime caches
+        if: always() && steps.runtimecache.outputs['cache-hit'] != 'true' && steps.cpython.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/Library/Caches/tvbox-ffmpeg
+            build/FFmpeg
+            build/AppleRuntime
+            build/ApplePython
+            build/NodeMobile
+            build/apple-runtime
+            build/apple-python
+          key: yingxia-runtimes-${{ runner.os }}-${{ hashFiles('Scripts/build-apple-*.sh', 'Scripts/package-apple-runtime.sh', 'Scripts/fetch-node-mobile.sh') }}
