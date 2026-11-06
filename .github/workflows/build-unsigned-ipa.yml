@@ -268,7 +268,7 @@ jobs:
               "versionName": vn,
               "versionCode": vc_int,
               "code": vc_int,
-              "desc": "v%s-%s - %s" % (vn, tag, commit),
+              "desc": "%s - %s" % (tag, commit),
               "channel": ch,
               "ipa": dl,
               "size": int(size),
