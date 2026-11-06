@@ -10,9 +10,11 @@
 #   FFmpeg -> desktop Java host -> cross-compiled iOS JVM -> embedded CPython
 #   -> nodejs-mobile -> XcodeGen -> xcodebuild -> IPA -> artifact -> Release.
 #
-# Xcode 26 / iOS 26 SDK compatibility patches are applied to the CI workspace
-# by scripts/apply-xcode26-patches.py (idempotent; fails loudly if upstream
-# changes an anchored snippet). They are NEVER written back to the mirror.
+# The build now runs on the GitHub `xcode-27` runner image, matching the
+# upstream author's Xcode 27.2 toolchain so the iOS 27 SwiftUI fileImporter
+# (and other iOS 27 paths) behave exactly like the official build. Only a
+# small UTType whitelist patch is still applied (scripts/apply-xcode26-patches.py);
+# it is NEVER written back to the mirror.
 #
 # Releases are published HERE (mlzbest/upstream-sync), not in mmusic: a tag
 # created in mmusic would be pruned by the next daily `git push --mirror`.
@@ -52,9 +54,10 @@ concurrency:
 jobs:
   build:
     name: Release arm64 unsigned IPA
-    # Xcode 26 / iOS 26 SDK is required (project.yml uses iOS 26/27 APIs,
-    # Swift 6.0, and a JDK 26 boot JDK for the embedded JVM).
-    runs-on: macos-latest
+    # Built on the GitHub `xcode-27` runner image (Xcode 27.2 / ios27 SDK),
+    # matching the upstream author's toolchain. project.yml uses iOS 26/27
+    # APIs, Swift 6.0, and a JDK 26 boot JDK for the embedded JVM.
+    runs-on: xcode-27
     timeout-minutes: 360
 
     env:
@@ -78,9 +81,10 @@ jobs:
         with:
           path: .ci
 
-      - name: Apply Xcode 26 SDK compatibility patches
-        # Exact fixes validated by run 42036607258. Applied to the CI
-        # workspace only - the mirror itself stays pristine.
+      - name: Apply CI workspace patches
+        # Only the UTType whitelist fix remains; on the xcode-27 image the
+        # upstream iOS 27 source compiles as-is. Applied to the CI workspace
+        # only - the mirror itself stays pristine.
         run: python3 .ci/scripts/apply-xcode26-patches.py .
 
       - name: Report toolchain
@@ -89,11 +93,11 @@ jobs:
           xcodebuild -version
           ls -d /Applications/Xcode*.app 2>/dev/null || true
 
-      - name: Select Xcode 26
+      - name: Select Xcode 27
         run: |
-          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          XCODE=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
           if [ -z "$XCODE" ]; then
-            echo "::error::No Xcode 26 on this runner. Pin a runner image that ships Xcode 26, or use a self-hosted Mac."
+            echo "::error::No Xcode 27 on this runner (runs-on must be the xcode-27 image)."
             exit 1
           fi
           sudo xcode-select -s "$XCODE"
@@ -139,7 +143,7 @@ jobs:
             build/NodeMobile
             build/apple-runtime
             build/apple-python
-          key: yingxia-runtimes-${{ runner.os }}-${{ hashFiles('Scripts/build-apple-*.sh', 'Scripts/package-apple-runtime.sh', 'Scripts/fetch-node-mobile.sh') }}
+          key: yingxia-runtimes-${{ runner.os }}-xcode27-${{ hashFiles('Scripts/build-apple-*.sh', 'Scripts/package-apple-runtime.sh', 'Scripts/fetch-node-mobile.sh') }}
 
       - name: Build FFmpeg + dav1d xcframework
         # Package.swift declares Vendor/FFmpeg/FFmpeg.xcframework as a local
@@ -305,4 +309,4 @@ jobs:
             build/NodeMobile
             build/apple-runtime
             build/apple-python
-          key: yingxia-runtimes-${{ runner.os }}-${{ hashFiles('Scripts/build-apple-*.sh', 'Scripts/package-apple-runtime.sh', 'Scripts/fetch-node-mobile.sh') }}
+          key: yingxia-runtimes-${{ runner.os }}-xcode27-${{ hashFiles('Scripts/build-apple-*.sh', 'Scripts/package-apple-runtime.sh', 'Scripts/fetch-node-mobile.sh') }}
