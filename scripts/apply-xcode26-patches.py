@@ -102,20 +102,21 @@ struct DocumentImporter: UIViewControllerRepresentable {
 
 PATCHES = [
     # 1. Widen the subscription file whitelist.
+    #    Upstream 1.8.14 (commit 645ad2b, #725) added .m3uPlaylist + .plainText
+    #    for M3U / TXT live playlists; re-anchored on top of that.
     (
         "App/SettingsView.swift",
         "SubscriptionFile.types widened with .item + .data",
-        """    static let types: [UTType] = [.json, .pythonScript, .javaScript]
+        """    static let types: [UTType] = [.json, .pythonScript, .javaScript, .m3uPlaylist, .plainText]
 """,
         """    // CI patch: iOS classifies files saved from WeChat, Safari, QQ or the
     // Files app as public.data or a dynamic UTType (dyn.*), which may
-    // conform to public.item but NOT to public.data. With only
-    // .json / .pythonScript / .javaScript the document picker shows those
-    // files greyed out and they cannot be selected at all. .item is the
-    // ROOT of the UTType hierarchy and matches literally every file,
-    // including extension-less and dyn.* ones. The importer still parses
-    // by CONTENT (subscriptionImport probes the bytes, not the extension).
-    static let types: [UTType] = [.item, .data, .content, .text, .plainText, .json, .pythonScript, .javaScript]
+    // conform to public.item but NOT to public.data. Upstream's own list
+    // still leaves those greyed out. .item is the ROOT of the UTType
+    // hierarchy and matches literally every file, including extension-less
+    // and dyn.* ones. The importer still parses by CONTENT
+    // (subscriptionImport probes the bytes, not the extension).
+    static let types: [UTType] = [.item, .data, .content, .text, .plainText, .json, .m3uPlaylist, .pythonScript, .javaScript]
 """,
     ),
     # 2. Add subscription sheet (iOS): .fileImporter -> UIKit picker.
