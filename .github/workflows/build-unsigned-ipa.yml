@@ -150,10 +150,30 @@ jobs:
             build/apple-python
           key: yingxia-runtimes-${{ runner.os }}-xcode27-${{ hashFiles('Scripts/build-apple-*.sh', 'Scripts/package-apple-runtime.sh', 'Scripts/fetch-node-mobile.sh') }}
 
+      - name: Restore LibASS cache
+        id: libasscache
+        # Separate cache entry: the runtimes key above was already saved by the
+        # failed run 42545103104 (without LibASS artifacts), and GitHub cache
+        # entries are immutable — saving under the same key would be a no-op.
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/Library/Caches/tvbox-libass
+          key: yingxia-libass-${{ runner.os }}-${{ hashFiles('Scripts/build-apple-libass.sh') }}
+
       - name: Build FFmpeg + dav1d xcframework
         # Package.swift declares Vendor/FFmpeg/FFmpeg.xcframework as a local
         # binaryTarget; that path is a symlink populated by this script.
         run: Scripts/build-apple-ffmpeg.sh
+
+      - name: Build LibASS xcframework
+        id: libassbuild
+        # Upstream 1.8.14 (ASS/SSA subtitle rendering): Vendor/LibASS/
+        # LibASS.xcframework is a git symlink into build/LibASS, resolved by
+        # SwiftPM as a local binaryTarget. Without this step xcodebuild dies
+        # with "does not contain a binary artifact" (run 42545103104). Same
+        # pattern as FFmpeg above; script self-caches in ~/Library/Caches/
+        # tvbox-libass and exits fast when up to date.
+        run: Scripts/build-apple-libass.sh
 
       - name: Build desktop Java host
         # setup-java already exported JAVA_HOME; post-build phases run
@@ -324,6 +344,14 @@ jobs:
             --notes "$NOTES" \
             $PRERELEASE_FLAG
           echo "::notice::Released ${TAG} -> https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+
+      - name: Save LibASS cache
+        if: always() && steps.libasscache.outputs['cache-hit'] != 'true' && steps.libassbuild.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/Library/Caches/tvbox-libass
+          key: yingxia-libass-${{ runner.os }}-${{ hashFiles('Scripts/build-apple-libass.sh') }}
 
       # Run even when a later step failed (if: always()), but only when the
       # runtime products were actually produced. Cache upload is best-effort:
