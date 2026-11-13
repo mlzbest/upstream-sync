@@ -206,17 +206,20 @@ PATCHES = [
 """,
     ),
     # 5. Danmaku (xml/json) import.
+    #    Re-anchored for 1.8.19 (#937 configurable danmaku services): upstream
+    #    renamed the onDisappear body to cancelWork() and inserted three
+    #    onChange/onReceive modifiers right before the importer. The anchor now
+    #    covers only the importer and its handler, so modifier churn above it
+    #    no longer breaks the build.
     (
         "App/CatalogDanmakuView.swift",
         "CatalogDanmakuSettingsView fileImporter -> DocumentImporter",
-        """        .onDisappear { work?.cancel() }
-        .fileImporter(isPresented: $showsImporter, allowedContentTypes: [.xml, .json]) { result in
+        """        .fileImporter(isPresented: $showsImporter, allowedContentTypes: [.xml, .json]) { result in
             do { try model.importFile(result.get()); dismiss() }
             catch { self.error = error.localizedDescription }
         }
 """,
-        """        .onDisappear { work?.cancel() }
-        #if os(iOS)
+        """        #if os(iOS)
         .sheet(isPresented: $showsImporter) {
             DocumentImporter(types: [.xml, .json],
                              onPick: { urls in
@@ -235,8 +238,6 @@ PATCHES = [
         #endif
 """,
     ),
-    # NOTE: FeedbackView's `.fileImporter` is macOS-only (iOS uses PhotosPicker),
-    # so it is intentionally left untouched.
 ]
 
 
